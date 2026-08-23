@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #14263d;
+  --card: #ffffff;
+  --card-foreground: #14263d;
+  --primary: #214f7d;
+  --primary-foreground: #ffffff;
+  --secondary: #eaf1f8;
+  --secondary-foreground: #214f7d;
+  --muted: #eaf1f8;
+  --muted-foreground: #5c6b7d;
+  --accent: #eaf1f8;
+  --accent-foreground: #214f7d;
+  --destructive: #b4232f;
+  --border: #d7e0e9;
+  --input: #bdcbd8;
+  --ring: #214f7d;
+  --warning: #a86400;
+  --warning-background: #fff5d6;
+  --success: #287a4d;
+  --success-background: #e8f5ec;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-warning: var(--warning);
+  --color-warning-background: var(--warning-background);
+  --color-success: var(--success);
+  --color-success-background: var(--success-background);
+}
+
+@layer base {
+  * { @apply border-border; }
+  body { @apply m-0 min-w-80 bg-background text-foreground antialiased; font-family: Pretendard, "Noto Sans KR", system-ui, sans-serif; }
+  button, input { font: inherit; }
+}

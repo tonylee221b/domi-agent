@@ -1,0 +1,12 @@
+spring:
+  application:
+    name: senior-life-booking-agent
+
+server:
+  port: 7700
+
+public-data:
+  service-key: ${PUBLIC_DATA_SERVICE_KEY:}
+
+rag:
+  enabled: ${RAG_ENABLED:true}

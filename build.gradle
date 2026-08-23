@@ -1,0 +1,60 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '4.1.0'
+    id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'org.example'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://repo.spring.io/milestone' }
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'com.embabel.agent:embabel-agent-starter:1.5.0'
+    implementation 'com.embabel.agent:embabel-agent-starter-openai:1.5.0'
+    implementation 'com.embabel.agent:embabel-agent-rag-lucene:1.5.0'
+    implementation 'com.embabel.agent:embabel-agent-rag-tika:1.5.0'
+    implementation 'org.slf4j:slf4j-api'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    environment 'OPENAI_API_KEY', 'test-key'
+    environment 'RAG_ENABLED', 'false'
+}
+
+def frontendDir = file('frontend')
+
+tasks.register('frontendInstall', Exec) {
+    workingDir frontendDir
+    commandLine 'npm', 'ci'
+    inputs.files "$frontendDir/package.json", "$frontendDir/package-lock.json"
+    outputs.dir "$frontendDir/node_modules"
+}
+
+tasks.register('frontendBuild', Exec) {
+    dependsOn 'frontendInstall'
+    workingDir frontendDir
+    commandLine 'npm', 'run', 'build'
+    inputs.files "$frontendDir/package.json", "$frontendDir/package-lock.json", "$frontendDir/tsconfig.json", "$frontendDir/vite.config.ts", "$frontendDir/index.html"
+    inputs.dir "$frontendDir/src"
+    outputs.dir "$frontendDir/dist"
+}
+
+tasks.named('processResources') {
+    dependsOn 'frontendBuild'
+    from("$frontendDir/dist") {
+        into 'static'
+    }
+}
