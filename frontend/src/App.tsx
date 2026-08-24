@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import {
   AlertTriangle,
   ArrowRight,
@@ -50,16 +50,27 @@ type PreviewResponse = {
   page: number
   hasMore: boolean
 }
-type ReservationResponse = { message: string; reservationNumbers: string[] }
+type TransportPrefill = { destination: string; date: string; preferredArrivalTime: string }
+type ReservationResponse = {
+  message: string
+  reservationNumbers: string[]
+  retryPreview?: PreviewResponse
+  transportPrefill?: TransportPrefill
+}
 type QuestionResponse = { highlights: string[]; detail: string }
 
 type SpeechRecognitionLike = {
   lang: string
+  continuous: boolean
   interimResults: boolean
   start: () => void
+  stop: () => void
   onresult: (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void
-  onerror: () => void
+  onerror: (event: { error: string }) => void
+  onend: () => void
 }
+
+type SpeechTarget = "request" | "question"
 
 declare global {
   interface Window {
@@ -96,7 +107,10 @@ const en: Record<string, string> = {
   "어느 병원에 가고 싶으세요?": "Which hospital would you like to visit?",
   "교통편 찾기": "Transportation",
   "어디로 가고 싶으세요?": "Where would you like to go?",
+  "어디에서 출발하시나요?": "Where are you departing from?",
   "아래에서 하나씩 고르거나 음성으로 말씀해 주세요.": "Choose each item below or use voice input.",
+  "예약한 병원의 날짜, 진료 시간과 주소를 사용합니다.": "The hospital date, appointment time, and address are already filled in.",
+  "역이나 터미널에서 병원까지 가는 시간은 포함되지 않습니다.": "Travel time from the station or terminal to the hospital is not included.",
   "언제 가시나요?": "When are you going?",
   "오늘": "Today", "내일": "Tomorrow", "모레": "In two days",
   "오전인가요, 오후인가요?": "Morning or afternoon?",
@@ -107,7 +121,8 @@ const en: Record<string, string> = {
   "진료과": "Department", "진료과를 골라주세요": "Choose a department",
   "말로 하셔도 돼요": "You can also speak",
   "목록에 없는 장소나 자세한 요청은 음성으로 말씀해 주세요.": "Use voice input for places or details not listed.",
-  "음성으로 말하기": "Speak", "들은 내용": "What I heard", "선택 내용 사용하기": "Use selected options",
+  "음성으로 말하기": "Speak", "음성으로 질문하기": "Ask by voice", "듣는 중… 눌러서 멈추기": "Listening… Select to stop",
+  "들은 내용": "What I heard", "선택 내용 사용하기": "Use selected options",
   "이전": "Back", "다음": "Next", "찾고 있어요…": "Searching…",
   "선택한 일정": "Selected schedule", "이 일정으로 예약할까요?": "Would you like to book this schedule?",
   "시간과 비용을 함께 확인해 주세요.": "Please check the time and price.", "선택지": "Options",
@@ -139,6 +154,8 @@ const en: Record<string, string> = {
   "안과": "Ophthalmology", "이비인후과": "ENT", "피부과": "Dermatology", "재활의학과": "Rehabilitation Medicine",
   "가정의학과": "Family Medicine", "치과": "Dentistry",
   "이 브라우저에서는 음성 입력을 지원하지 않습니다. 아래 선택 버튼을 이용해 주세요.": "Voice input is not supported in this browser. Please use the options below.",
+  "마이크 권한이 필요합니다. 브라우저 설정에서 마이크를 허용해 주세요.": "Microphone permission is required. Allow microphone access in your browser settings.",
+  "마이크를 찾을 수 없습니다. 연결 상태를 확인해 주세요.": "No microphone was found. Check that it is connected.",
   "말씀을 듣지 못했습니다. 다시 눌러 천천히 말씀해 주세요.": "I couldn't hear you. Please try again and speak slowly.",
   "궁금한 내용을 입력해 주세요.": "Enter your question.", "답을 찾지 못했습니다.": "I couldn't find an answer.",
   "답을 찾는 데 시간이 오래 걸리고 있습니다. 다시 시도해 주세요.": "The answer is taking too long. Please try again.",
@@ -171,12 +188,16 @@ export default function App() {
   const [optionIndex, setOptionIndex] = useState(0)
   const [carouselPage, setCarouselPage] = useState(0)
   const [completed, setCompleted] = useState<ReservationResponse>()
+  const [transportPrefill, setTransportPrefill] = useState<TransportPrefill>()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
   const [question, setQuestion] = useState("")
   const [answer, setAnswer] = useState<QuestionResponse>()
   const [questionLoading, setQuestionLoading] = useState(false)
   const [questionError, setQuestionError] = useState("")
+  const [listeningTarget, setListeningTarget] = useState<SpeechTarget>()
+  const recognitionRef = useRef<SpeechRecognitionLike | undefined>(undefined)
+  const keepListeningRef = useRef(false)
   const t = (value: string) => translate(locale, value)
   const money = new Intl.NumberFormat(locale === "ko" ? "ko-KR" : "en-US")
   const price = (value: number) => locale === "ko" ? `${money.format(value)}원` : `₩${money.format(value)}`
@@ -187,20 +208,38 @@ export default function App() {
     localStorage.setItem("locale", locale)
   }, [locale])
 
+  useEffect(() => () => {
+    keepListeningRef.current = false
+    recognitionRef.current?.stop()
+  }, [])
+
   const step = { choose: 1, request: 2, preview: 3, payment: 4, reserving: 4, complete: 5 }[stage]
   const option = preview?.options[optionIndex]
   const options = preview?.options ?? []
   const carouselPages = Math.ceil(options.length / 3)
   const visibleOptions = options.slice(carouselPage * 3, carouselPage * 3 + 3)
 
-  function begin(nextType: BookingType, initialDestination = "") {
+  function begin(nextType: BookingType) {
     setType(nextType)
     setMessage("")
     setDateChoice("오늘")
     setTimeChoice(undefined)
     setOrigin("")
-    setDestination(initialDestination)
+    setDestination("")
     setDepartment("")
+    setTransportPrefill(undefined)
+    setError("")
+    setStage("request")
+  }
+
+  function continueWithTransport() {
+    if (!completed?.transportPrefill) return
+    setType("TRANSPORT")
+    setMessage("")
+    setOrigin("")
+    setDestination(completed.transportPrefill.destination)
+    setDepartment("")
+    setTransportPrefill(completed.transportPrefill)
     setError("")
     setStage("request")
   }
@@ -212,21 +251,71 @@ export default function App() {
     setAnswer(undefined)
   }
 
-  function listen() {
+  function listen(target: SpeechTarget) {
+    if (listeningTarget) {
+      keepListeningRef.current = false
+      recognitionRef.current?.stop()
+      return
+    }
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
     if (!Recognition) {
-      setError(t("이 브라우저에서는 음성 입력을 지원하지 않습니다. 아래 선택 버튼을 이용해 주세요."))
+      const message = t("이 브라우저에서는 음성 입력을 지원하지 않습니다. 아래 선택 버튼을 이용해 주세요.")
+      target === "question" ? setQuestionError(message) : setError(message)
       return
     }
     const recognition = new Recognition()
+    recognitionRef.current = recognition
     recognition.lang = locale === "ko" ? "ko-KR" : "en-US"
+    recognition.continuous = true
     recognition.interimResults = false
     recognition.onresult = (event) => {
-      setMessage(event.results[0][0].transcript)
-      setError("")
+      const transcript = event.results[event.results.length - 1][0].transcript
+      if (target === "question") {
+        setQuestion(transcript)
+        setQuestionError("")
+      } else {
+        setMessage(transcript)
+        setError("")
+      }
     }
-    recognition.onerror = () => setError(t("말씀을 듣지 못했습니다. 다시 눌러 천천히 말씀해 주세요."))
-    recognition.start()
+    recognition.onerror = (event) => {
+      if (["not-allowed", "service-not-allowed", "audio-capture", "network", "language-not-supported"].includes(event.error)) {
+        keepListeningRef.current = false
+      }
+      const message = t(event.error === "not-allowed" || event.error === "service-not-allowed"
+        ? "마이크 권한이 필요합니다. 브라우저 설정에서 마이크를 허용해 주세요."
+        : event.error === "audio-capture"
+          ? "마이크를 찾을 수 없습니다. 연결 상태를 확인해 주세요."
+          : "말씀을 듣지 못했습니다. 다시 눌러 천천히 말씀해 주세요.")
+      target === "question" ? setQuestionError(message) : setError(message)
+    }
+    recognition.onend = () => {
+      if (keepListeningRef.current && recognitionRef.current === recognition) {
+        window.setTimeout(() => {
+          if (!keepListeningRef.current || recognitionRef.current !== recognition) return
+          try {
+            recognition.start()
+          } catch {
+            keepListeningRef.current = false
+            recognitionRef.current = undefined
+            setListeningTarget(undefined)
+          }
+        }, 100)
+      } else {
+        recognitionRef.current = undefined
+        setListeningTarget(undefined)
+      }
+    }
+    target === "question" ? setQuestionError("") : setError("")
+    keepListeningRef.current = true
+    setListeningTarget(target)
+    try {
+      recognition.start()
+    } catch {
+      keepListeningRef.current = false
+      recognitionRef.current = undefined
+      setListeningTarget(undefined)
+    }
   }
 
   async function askQuestion() {
@@ -263,8 +352,11 @@ export default function App() {
         : `${dateChoice} ${timeChoice}에 ${destination} 지역의 ${department} 진료를 받고 싶어.`
       : ""
     const requestMessage = message.trim() || selectedMessage
-    if (!requestMessage) {
-      setError(t(type === "HOSPITAL"
+    const prefilledOrigin = message.trim() || origin
+    if (transportPrefill ? !prefilledOrigin : !requestMessage) {
+      setError(t(transportPrefill
+        ? "출발지를 골라주세요"
+        : type === "HOSPITAL"
         ? "날짜, 시간, 병원 지역과 진료과를 모두 골라 주세요."
         : "날짜, 시간, 출발지와 목적지를 모두 골라 주세요."))
       return
@@ -276,10 +368,12 @@ export default function App() {
     setLoading(true)
     setError("")
     try {
-      const response = await fetch("/api/bookings/preview", {
+      const response = await fetch(transportPrefill ? "/api/bookings/preview/transport-prefill" : "/api/bookings/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type, message: requestMessage }),
+        body: JSON.stringify(transportPrefill
+          ? { ...transportPrefill, origin: prefilledOrigin }
+          : { type, message: requestMessage }),
         signal: AbortSignal.timeout(45_000),
       })
       const body = await response.json()
@@ -348,6 +442,14 @@ export default function App() {
       ])
       const body = await response.json()
       if (!response.ok) throw new Error(locale === "ko" ? body.message || t("예약을 완료하지 못했습니다.") : t("예약을 완료하지 못했습니다."))
+      if (body.retryPreview) {
+        setPreview(body.retryPreview)
+        setOptionIndex(0)
+        setCarouselPage(0)
+        setCompleted(undefined)
+        setStage("preview")
+        return
+      }
       setCompleted(body)
       setStage("complete")
     } catch (reason) {
@@ -363,6 +465,7 @@ export default function App() {
     setPreview(undefined)
     setCompleted(undefined)
     setError("")
+    setTransportPrefill(undefined)
   }
 
   function goBack() {
@@ -425,6 +528,9 @@ export default function App() {
               <CardContent>
                 <div className="flex flex-col gap-3 sm:flex-row">
                   <Input value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => event.key === "Enter" && askQuestion()} placeholder={t("예: KTX 경로 할인은 주말에도 되나요?")} aria-label={t("병원과 교통 이용 안내 질문")} />
+                  <Button className="shrink-0" variant={listeningTarget === "question" ? "destructive" : "outline"} onClick={() => listen("question")} aria-pressed={listeningTarget === "question"}>
+                    <Mic aria-hidden="true" />{t(listeningTarget === "question" ? "듣는 중… 눌러서 멈추기" : "음성으로 질문하기")}
+                  </Button>
                   <Button className="shrink-0" onClick={askQuestion} disabled={questionLoading}><Search aria-hidden="true" />{t(questionLoading ? "찾는 중…" : "물어보기")}</Button>
                 </div>
                 <ErrorMessage message={questionError} />
@@ -444,30 +550,38 @@ export default function App() {
         {stage === "request" && (
           <section>
             <p className="mb-3 text-lg font-medium text-primary">{t(type === "HOSPITAL" ? "병원 예약" : "교통편 찾기")}</p>
-            <h1 className="text-4xl font-medium leading-tight tracking-tight sm:text-5xl">{t(type === "HOSPITAL" ? "어느 병원에 가고 싶으세요?" : "어디로 가고 싶으세요?")}</h1>
+            <h1 className="text-4xl font-medium leading-tight tracking-tight sm:text-5xl">{t(type === "HOSPITAL" ? "어느 병원에 가고 싶으세요?" : transportPrefill ? "어디에서 출발하시나요?" : "어디로 가고 싶으세요?")}</h1>
             <p className="mb-8 mt-5 text-xl text-muted-foreground">{t("아래에서 하나씩 고르거나 음성으로 말씀해 주세요.")}</p>
+
+            {transportPrefill && (
+              <div className="mb-6 rounded-2xl border-2 border-primary/30 bg-secondary/30 p-6">
+                <p className="text-xl font-medium">{t("예약한 병원의 날짜, 진료 시간과 주소를 사용합니다.")}</p>
+                <p className="mt-3 text-lg">{transportPrefill.date} · {transportPrefill.preferredArrivalTime} · {transportPrefill.destination}</p>
+                <p className="mt-3 text-lg text-warning">{t("역이나 터미널에서 병원까지 가는 시간은 포함되지 않습니다.")}</p>
+              </div>
+            )}
 
             <Card>
               <CardContent className="space-y-8 pt-7">
-                <fieldset>
+                {!transportPrefill && <fieldset>
                   <legend className="mb-4 text-2xl font-medium">{t("언제 가시나요?")}</legend>
                   <div className="grid grid-cols-3 gap-3">
                     {(["오늘", "내일", "모레"] as DateChoice[]).map((value) => (
                       <SelectionCard key={value} selected={dateChoice === value} onClick={() => setDateChoice(value)}>{t(value)}</SelectionCard>
                     ))}
                   </div>
-                </fieldset>
+                </fieldset>}
 
-                <fieldset>
+                {!transportPrefill && <fieldset>
                   <legend className="mb-4 text-2xl font-medium">{t("오전인가요, 오후인가요?")}</legend>
                   <div className="grid grid-cols-2 gap-4">
                     {(["오전", "오후"] as TimeChoice[]).map((value) => (
                       <SelectionCard key={value} selected={timeChoice === value} onClick={() => setTimeChoice(value)}>{t(value)}</SelectionCard>
                     ))}
                   </div>
-                </fieldset>
+                </fieldset>}
 
-                <div className={`grid gap-5 ${type === "TRANSPORT" ? "sm:grid-cols-2" : ""}`}>
+                <div className={`grid gap-5 ${type === "TRANSPORT" && !transportPrefill ? "sm:grid-cols-2" : ""}`}>
                   {type === "TRANSPORT" && (
                     <label className="text-xl font-medium">
                       {t("출발지")}
@@ -477,13 +591,13 @@ export default function App() {
                       </select>
                     </label>
                   )}
-                  <label className="text-xl font-medium">
+                  {!transportPrefill && <label className="text-xl font-medium">
                     {t(type === "HOSPITAL" ? "병원 지역" : "목적지")}
                     <select className="mt-3 h-14 w-full rounded-xl border-2 bg-card px-4 text-lg outline-none focus-visible:ring-4 focus-visible:ring-ring/40" value={destination} onChange={(event) => setDestination(event.target.value)}>
                       <option value="">{t(type === "HOSPITAL" ? "병원 지역을 골라주세요" : "목적지를 골라주세요")}</option>
                       {(type === "HOSPITAL" ? hospitalRegions : transportLocations).map((location) => <option key={location} value={location}>{t(location)}</option>)}
                     </select>
-                  </label>
+                  </label>}
                 </div>
 
                 {type === "HOSPITAL" && (
@@ -501,7 +615,9 @@ export default function App() {
             <div className="mt-7 rounded-2xl border-2 border-primary/30 bg-secondary/30 p-6">
               <h2 className="text-2xl font-medium">{t("말로 하셔도 돼요")}</h2>
               <p className="mt-2 text-lg text-muted-foreground">{t("목록에 없는 장소나 자세한 요청은 음성으로 말씀해 주세요.")}</p>
-              <Button className="mt-5" size="lg" variant="outline" onClick={listen}><Mic aria-hidden="true" />{t("음성으로 말하기")}</Button>
+              <Button className="mt-5" size="lg" variant={listeningTarget === "request" ? "destructive" : "outline"} onClick={() => listen("request")} aria-pressed={listeningTarget === "request"}>
+                <Mic aria-hidden="true" />{t(listeningTarget === "request" ? "듣는 중… 눌러서 멈추기" : "음성으로 말하기")}
+              </Button>
               {message && (
                 <div className="mt-5 rounded-xl bg-card p-5" aria-live="polite">
                   <div className="text-base text-muted-foreground">{t("들은 내용")}</div>
@@ -570,6 +686,7 @@ export default function App() {
                                 </div>
                               </div>
                             )}
+                            {preview.type === "TRANSPORT" && <p className="whitespace-pre-line text-lg leading-relaxed text-muted-foreground">{candidate.summary}</p>}
                             {candidate.warning && <p className="text-lg text-warning">{candidate.warning}</p>}
                             <strong className="pt-2 text-2xl font-medium">{price(candidate.totalPrice)}</strong>
                           </CardHeader>
@@ -596,7 +713,7 @@ export default function App() {
             <Card className="border-primary" aria-live="polite">
               <CardHeader>
                 <CardTitle>{title(option.title)}</CardTitle>
-                <CardDescription>{locale === "en" && preview.type === "HOSPITAL" ? `Hospital hours: ${option.summary.replace("병원 운영시간: ", "")}` : t(option.summary)}</CardDescription>
+                <CardDescription className="whitespace-pre-line">{locale === "en" && preview.type === "HOSPITAL" ? `Hospital hours: ${option.summary.replace("병원 운영시간: ", "")}` : t(option.summary)}</CardDescription>
                 {option.transportMode && <TransportSchedule option={option} t={t} />}
               </CardHeader>
               <CardContent>
@@ -680,7 +797,7 @@ export default function App() {
                   <CardDescription>{t("기차와 버스 시간을 이어서 찾아드릴게요.")}</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <Button className="w-full" size="lg" onClick={() => begin("TRANSPORT", destination)}>{t("교통편 알아보기")}</Button>
+                  <Button className="w-full" size="lg" onClick={continueWithTransport}>{t("교통편 알아보기")}</Button>
                 </CardContent>
               </Card>
             )}

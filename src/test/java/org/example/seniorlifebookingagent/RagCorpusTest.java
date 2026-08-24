@@ -21,7 +21,7 @@ class RagCorpusTest {
             }
         }
 
-        assertThat(guides).hasSizeGreaterThanOrEqualTo(10);
+        assertThat(guides).hasSizeGreaterThanOrEqualTo(8);
     }
 
     @Test
@@ -30,6 +30,20 @@ class RagCorpusTest {
             .getResource("classpath:rag/transport/supported-modes.md")
             .getContentAsString(StandardCharsets.UTF_8);
 
-        assertThat(guide).contains("시내버스와 택시", "현재 지원하지 않는다");
+        assertThat(guide).contains(
+            "시내버스와 택시는 지원하지 않습니다",
+            "노선, 요금, 할인, 호출 또는 예약",
+            "기차·시외버스·고속버스"
+        );
+    }
+
+    @Test
+    void corpusDoesNotContainConflictingCityBusGuides() throws Exception {
+        var guides = new PathMatchingResourcePatternResolver()
+            .getResources("classpath*:rag/**/*.md");
+
+        for (var guide : guides) {
+            assertThat(guide.getContentAsString(StandardCharsets.UTF_8)).doesNotContain("category: city-bus");
+        }
     }
 }

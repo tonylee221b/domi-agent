@@ -9,7 +9,11 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import org.example.seniorlifebookingagent.agent.HospitalAppointmentAgent;
@@ -22,6 +26,8 @@ import org.example.seniorlifebookingagent.domain.transport.ApprovedTransportPlan
 import org.example.seniorlifebookingagent.domain.transport.TransportMode;
 import org.example.seniorlifebookingagent.domain.transport.TransportOptions;
 import org.example.seniorlifebookingagent.domain.transport.TransportPlan;
+import org.example.seniorlifebookingagent.domain.transport.TransportRequest;
+import org.example.seniorlifebookingagent.domain.transport.TransportRecommendations;
 import org.example.seniorlifebookingagent.support.KoreanDateTime;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -80,13 +86,32 @@ public class BookingController {
 
         return switch (pending.type()) {
             case HOSPITAL -> {
-                var completed = hospitalAgent.reserve(new ApprovedHospitalAppointment(
-                    (HospitalAppointment) pending.plan()));
-                yield new ReservationResponse("병원 예약이 완료됐어요.", List.of(completed.reservationNumber()));
+                try {
+                    var completed = hospitalAgent.reserve(new ApprovedHospitalAppointment(
+                        (HospitalAppointment) pending.plan()));
+                    var appointment = completed.appointment();
+                    yield new ReservationResponse(
+                        "병원 예약이 완료됐어요.",
+                        List.of(completed.reservationNumber()),
+                        null,
+                        new TransportPrefill(
+                            appointment.address(),
+                            appointment.appointmentTime().toLocalDate(),
+                            appointment.appointmentTime().toLocalTime())
+                    );
+                } catch (IllegalStateException reservationFailure) {
+                    yield new ReservationResponse(
+                        "선택한 예약이 방금 마감되어 같은 조건으로 다시 찾았습니다.",
+                        List.of(),
+                        retryHospital(pending),
+                        null
+                    );
+                }
             }
             case TRANSPORT -> {
                 var completed = transportAgent.reserve(new ApprovedTransportPlan((TransportPlan) pending.plan()));
-                yield new ReservationResponse("교통편 예약이 완료됐어요.", List.of(completed.reservationNumber()));
+                yield new ReservationResponse(
+                    "교통편 예약이 완료됐어요.", List.of(completed.reservationNumber()), null, null);
             }
         };
     }
@@ -100,6 +125,15 @@ public class BookingController {
         return previewHospitalPage(request.searchId(), search, request.page());
     }
 
+    @PostMapping("/preview/transport-prefill")
+    public PreviewResponse transportPrefill(@Valid @RequestBody TransportPrefillRequest request) {
+        var transportRequest = new TransportRequest(
+            request.origin(), request.destination(), request.date(), null,
+            request.preferredArrivalTime().toString());
+        return previewTransport(agents.<TransportRequest, TransportRecommendations>asFunction(TransportRecommendations.class)
+            .apply(transportRequest, ProcessOptions.DEFAULT));
+    }
+
     private PreviewResponse previewHospital(String message) {
         var function = agents.<UserInput, HospitalRequest>asFunction(HospitalRequest.class);
         var request = function.apply(new UserInput(message), ProcessOptions.DEFAULT);
@@ -110,7 +144,9 @@ public class BookingController {
 
     private PreviewResponse previewHospitalPage(UUID searchId, HospitalRequest request, int page) {
         var appointmentPage = hospitalAgent.searchPage(request, page, 10);
-        var options = appointmentPage.appointments().stream().map(this::hospitalOption).toList();
+        var options = appointmentPage.appointments().stream()
+                                     .map(appointment -> hospitalOption(appointment, request, null))
+                                     .toList();
         if (options.isEmpty()) {
             throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
                 "지금 예약할 수 있는 일정이 없습니다. 날짜나 시간을 바꿔 말씀해 주세요.");
@@ -118,8 +154,56 @@ public class BookingController {
         return new PreviewResponse(BookingType.HOSPITAL, options, searchId, page, appointmentPage.hasMore());
     }
 
-    private PreviewOption hospitalOption(HospitalAppointment appointment) {
-        var id = remember(BookingType.HOSPITAL, appointment);
+    private PreviewResponse retryHospital(PendingBooking pending) {
+        var failed = (HospitalAppointment) pending.plan();
+        var request = pending.hospitalRequest();
+        var appointmentPage = hospitalAgent.searchPage(request, 1, 10);
+        var options = appointmentPage.appointments().stream()
+                                     .filter(appointment -> !sameAppointment(failed, appointment))
+                                     .map(appointment -> hospitalOption(
+                                         appointment, request, hospitalChanges(failed, appointment)))
+                                     .toList();
+        if (options.isEmpty()) {
+            throw new IllegalStateException(
+                "선택한 시간이 마감되었고 같은 조건의 다른 예약 시간을 찾지 못했습니다. 날짜나 시간을 바꿔 다시 찾아주세요.");
+        }
+        var searchId = UUID.randomUUID();
+        hospitalSearches.put(searchId, request);
+        return new PreviewResponse(BookingType.HOSPITAL, options, searchId, 1, appointmentPage.hasMore());
+    }
+
+    private boolean sameAppointment(HospitalAppointment first, HospitalAppointment second) {
+        return Objects.equals(first.hospitalName(), second.hospitalName())
+            && Objects.equals(first.department(), second.department())
+            && Objects.equals(first.appointmentTime(), second.appointmentTime());
+    }
+
+    private String hospitalChanges(HospitalAppointment failed, HospitalAppointment replacement) {
+        var changes = new ArrayList<String>();
+        if (!Objects.equals(failed.hospitalName(), replacement.hospitalName())) {
+            changes.add("병원 %s → %s".formatted(failed.hospitalName(), replacement.hospitalName()));
+        }
+        if (!Objects.equals(failed.department(), replacement.department())) {
+            changes.add("진료과 %s → %s".formatted(failed.department(), replacement.department()));
+        }
+        if (!Objects.equals(failed.appointmentTime(), replacement.appointmentTime())) {
+            changes.add("진료 시간 %s → %s".formatted(
+                KoreanDateTime.format(failed.appointmentTime()),
+                KoreanDateTime.format(replacement.appointmentTime())));
+        }
+        if (failed.fee() != replacement.fee()) {
+            changes.add("진료비 %,d원 → %,d원".formatted(failed.fee(), replacement.fee()));
+        }
+        return "선택한 예약이 방금 마감되었습니다. 변경점: "
+            + String.join(" · ", changes) + ". 다시 승인해 주세요.";
+    }
+
+    private PreviewOption hospitalOption(
+        HospitalAppointment appointment,
+        HospitalRequest request,
+        String warning
+    ) {
+        var id = remember(BookingType.HOSPITAL, appointment, request);
         return new PreviewOption(
             id,
             "%s · %s".formatted(appointment.hospitalName(), appointment.department()),
@@ -136,14 +220,19 @@ public class BookingController {
                 new Detail("진료비", "%,d원".formatted(appointment.fee()))
             ),
             appointment.fee(),
-            null
+            warning
         );
     }
 
     private PreviewResponse previewTransport(String message) {
-        var function = agents.<UserInput, TransportOptions>asFunction(TransportOptions.class);
-        var result = function.apply(new UserInput(message), ProcessOptions.DEFAULT);
-        var options = result.plans().stream().map(this::transportOption).toList();
+        var function = agents.<UserInput, TransportRecommendations>asFunction(TransportRecommendations.class);
+        return previewTransport(function.apply(new UserInput(message), ProcessOptions.DEFAULT));
+    }
+
+    private PreviewResponse previewTransport(TransportRecommendations result) {
+        var options = result.recommendations().stream()
+                            .map(recommendation -> transportOption(recommendation.plan(), recommendation.reason()))
+                            .toList();
         if (options.isEmpty()) {
             throw new ResponseStatusException(HttpStatus.UNPROCESSABLE_ENTITY,
                 "이용할 수 있는 교통편이 없습니다. 날짜나 시간을 바꿔 말씀해 주세요.");
@@ -151,12 +240,12 @@ public class BookingController {
         return new PreviewResponse(BookingType.TRANSPORT, options, null, 1, false);
     }
 
-    private PreviewOption transportOption(TransportPlan plan) {
+    private PreviewOption transportOption(TransportPlan plan, String recommendationReason) {
         var id = remember(BookingType.TRANSPORT, plan);
         return new PreviewOption(
             id,
             "%s → %s".formatted(plan.legs().getFirst().origin(), plan.legs().getLast().destination()),
-            "환승과 요금을 함께 확인한 일정입니다.",
+            recommendationReason,
             plan.primaryMode(),
             plan.serviceInfo(),
             plan.legs().getFirst().origin(),
@@ -174,8 +263,12 @@ public class BookingController {
     }
 
     UUID remember(BookingType type, Object plan) {
+        return remember(type, plan, null);
+    }
+
+    UUID remember(BookingType type, Object plan, HospitalRequest hospitalRequest) {
         var id = UUID.randomUUID();
-        pendingBookings.put(id, new PendingBooking(type, plan));
+        pendingBookings.put(id, new PendingBooking(type, plan, hospitalRequest));
         return id;
     }
 
@@ -211,6 +304,14 @@ public class BookingController {
     public record HospitalPageRequest(@NotNull UUID searchId, @Min(1) int page) {
     }
 
+    public record TransportPrefillRequest(
+        @NotBlank String origin,
+        @NotBlank String destination,
+        @NotNull LocalDate date,
+        @NotNull LocalTime preferredArrivalTime
+    ) {
+    }
+
     public record PreviewResponse(
         BookingType type,
         List<PreviewOption> options,
@@ -239,12 +340,24 @@ public class BookingController {
     public record Detail(String label, String value) {
     }
 
-    public record ReservationResponse(String message, List<String> reservationNumbers) {
+    public record ReservationResponse(
+        String message,
+        List<String> reservationNumbers,
+        PreviewResponse retryPreview,
+        TransportPrefill transportPrefill
+    ) {
+    }
+
+    public record TransportPrefill(
+        String destination,
+        LocalDate date,
+        LocalTime preferredArrivalTime
+    ) {
     }
 
     public record ErrorResponse(String message) {
     }
 
-    private record PendingBooking(BookingType type, Object plan) {
+    private record PendingBooking(BookingType type, Object plan, HospitalRequest hospitalRequest) {
     }
 }
